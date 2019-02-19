@@ -1,0 +1,206 @@
+#############################
+#### This is a 4 node configuration service that use terminal interface towards
+#### existing deployment instance of vYos router and conigure it as spoke
+###########################
+tosca_definitions_version: cloudify_dsl_1_3
+
+#######
+##   imports of types and plugins
+#######
+imports:
+  - http://www.getcloudify.org/spec/cloudify/4.5/types.yaml
+  - plugin:cloudify-utilities-plugin
+
+#######
+##   inputs from user
+#######
+inputs:
+
+  branch_lan_address:
+    description: >
+      IP address of LAN network
+    default: "192.168.101.1/24"
+
+  branch_tunnel_address:
+    description: >
+      IP address of tunnel0 interface
+    default: "192.168.200.2/30"
+
+  branch_blueprint_name:
+    description: >
+      branch blueprint name
+    default: "vyos-branch-bp"
+
+  branch_deployment_name:
+    description: >
+      branch deployment name
+    default: "vyos-branch"
+
+  hub_tunnel_interface:
+    description: >
+      Tunnel interface on hub side in format tunX where X is branch ID
+    default: "tun1"
+
+  hub_tunnel_address:
+    description: >
+      IP address of tunnel0 interface
+    default: "192.168.200.1/30"
+
+  hub_blueprint_name:
+    description: >
+      Hub blueprint name
+    default: "vyos-hub-bp"
+
+  hub_deployment_name:
+    description: >
+      Hub deployment name
+    default: "vyos-hub"
+
+dsl_definitions:
+
+node_templates:
+
+#######
+##   deployment_proxy of the branch_depoloyment
+#######
+  vyos_vnf_hub_deployment:
+    type: cloudify.nodes.DeploymentProxy
+    properties:
+      resource_config:
+        blueprint:
+          id: { get_input: hub_blueprint_name }
+          external_resource: true
+        deployment:
+          id: { get_input: hub_deployment_name }
+          external_resource: true
+          outputs:
+            vyos_vnf_hub_mgmt_ip: hub_mgmt_ip
+            vyos_vnf_hub_wan_ip: hub_wan_ip
+            vyos_vnf_hub_username: hub_username
+            vyos_vnf_hub_password: hub_password
+
+#######
+##   deployment_proxy of the hub_depoloyment
+#######
+  vyos_vnf_branch_deployment:
+    type: cloudify.nodes.DeploymentProxy
+    properties:
+      resource_config:
+        blueprint:
+          id: { get_input: branch_blueprint_name }
+          external_resource: true
+        deployment:
+          id: { get_input: branch_deployment_name }
+          external_resource: true
+          outputs:
+            vyos_vnf_branch_mgmt_ip: branch_mgmt_ip
+            vyos_vnf_branch_wan_ip: branch_wan_ip
+            vyos_vnf_branch_username: branch_username
+            vyos_vnf_branch_password: branch_password
+
+#######
+##   configuring the VPN on the hub site
+#######
+  vyos_hub_vpn_service:
+    type: cloudify.terminal.raw
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          inputs:
+            terminal_auth: &terminal_auth_hub
+              user: { get_attribute: [vyos_vnf_hub_deployment, deployment, outputs, hub_username] }
+              password: {get_attribute: [vyos_vnf_hub_deployment, deployment, outputs, hub_password] }
+              ip: { get_attribute: [vyos_vnf_hub_deployment, deployment, outputs, hub_mgmt_ip ] }
+              promt_check:
+                - '#'
+                - '$'
+              errors:
+                - "Command fail."
+            calls:
+              - action: exit
+        start:
+          inputs:
+            terminal_auth: *terminal_auth_hub
+            calls:
+              - action: config
+              - template: resources/vyos-vnf-hub-vpn-start.config
+                params:
+                  user: { get_attribute: [vyos_vnf_hub_deployment, deployment, outputs, vyos_vnf_hub_username] }
+                  password: {get_attribute: [vyos_vnf_hub_deployment, deployment, outputs, vyos_vnf_hub_password] }
+                  HUB_TUNNEL_LOCAL_IP: { get_attribute: [vyos_vnf_hub_deployment, deployment, outputs, hub_wan_ip, 0] }
+                  HUB_TUNNEL_REMOTE_IP: { get_attribute: [vyos_vnf_branch_deployment, deployment, outputs, branch_wan_ip, 0] }
+                  TUNNEL_INTERFACE: { get_input: hub_tunnel_interface }
+              - action: commit
+              - action: save
+        stop:
+          inputs:
+            terminal_auth: *terminal_auth_hub
+            calls:
+              - action: config
+              - template: resources/vyos-vnf-hub-vpn-stop.config
+                params:
+                  TUNNEL_INTERFACE: { get_input: hub_tunnel_interface }
+              - action: commit
+              - action: save
+    relationships:
+      - type: cloudify.relationships.depends_on
+        target: vyos_vnf_hub_deployment
+
+#######
+##   configuring the VPN on the branch site
+#######
+  vyos_branch_vpn_service:
+    type: cloudify.terminal.raw
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          inputs:
+            terminal_auth: &terminal_auth_branch
+              user: { get_attribute: [vyos_vnf_branch_deployment, deployment, outputs, branch_username] }
+              password: {get_attribute: [vyos_vnf_branch_deployment, deployment, outputs, branch_password] }
+              ip: { get_attribute: [vyos_vnf_branch_deployment, deployment, outputs, branch_mgmt_ip ] }
+              promt_check:
+                - '#'
+                - '$'
+              errors:
+                - "Command fail."
+            calls:
+              - action: exit
+        start:
+          inputs:
+            terminal_auth: *terminal_auth_branch
+            calls:
+              - action: config
+              - template: resources/vyos-vnf-branch-vpn-start.config
+                params:
+                  BRANCH_TUNNEL_ADDRESS: { get_input: branch_tunnel_address }
+                  BRANCH_TUNNEL_LOCAL_IP: { get_attribute: [vyos_vnf_branch_deployment, deployment, outputs, branch_wan_ip, 0] }
+                  BRANCH_TUNNEL_REMOTE_IP: { get_attribute: [vyos_vnf_hub_deployment, deployment, outputs, hub_wan_ip, 0] }
+              - action: commit
+              - action: save
+        stop:
+          inputs:
+            terminal_auth: *terminal_auth_branch
+            calls:
+              - action: config
+              - action: delete interface tunnel tun0
+              - action: commit
+              - action: save
+    relationships:
+      - type: cloudify.relationships.depends_on
+        target: vyos_vnf_branch_deployment
+      - type: cloudify.relationships.depends_on
+        target: vyos_hub_vpn_service
+
+#######
+##   declaring outputs of the deployment
+#######
+outputs:
+  vyos_vnf_branch_mgmt_ip:
+    value: { get_attribute: [vyos_vnf_branch_deployment, ip] }
+  vyos_vnf_branch_wan_ip:
+    value: { get_attribute: [vyos_vnf_branch_deployment, networks, wan_net] }
+  vyos_vnf_branch_username:
+    value: { get_attribute: [vyos_vnf_branch_deployment, deployment, outputs, branch_username] }
+  vyos_vnf_branch_password:
+    value: { get_attribute: [vyos_vnf_branch_deployment, deployment, outputs, branch_password] }

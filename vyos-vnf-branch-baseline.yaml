@@ -1,0 +1,330 @@
+tosca_definitions_version: cloudify_dsl_1_3
+
+#######
+##   imports of types and plugins
+#######
+imports:
+  - http://www.getcloudify.org/spec/cloudify/4.5/types.yaml
+  - plugin:cloudify-openstack-plugin
+  - plugin:cloudify-utilities-plugin
+
+#######
+##   inputs from user
+#######
+inputs:
+
+  vyos_image_url:
+    default: "https://s3-eu-west-1.amazonaws.com/cloudify-labs/images/vyos-1.1.7-installed-day0.qcow"
+
+  flavor:
+    description: >
+      An Openstack Flavor ID.
+    default: { get_secret: medium_image_flavor }
+
+  user:
+    description: >
+      Username for VyOS router
+    default: "vyos"
+
+  password:
+    description: >
+      Password for VyOS router
+    default: "demo"
+
+  branch_hostname:
+    description: >
+      Branch hostname
+    default: "branch-1"
+
+  branch_lan_address:
+    description: >
+      IP address of LAN network
+    default: "192.168.101.1/24"
+
+  branch_lan_name:
+    description: >
+      Beranch LAN network name
+    default: "branch-1-lan"
+
+  branch_tunnel_address:
+    description: >
+      IP address of tunnel0 interface
+    default: "192.168.200.2/30"
+
+  base_network_cidr:
+    description: >
+      OSPF AREA 0 NETWORK CIDR
+    default: "192.168.0.0/16"
+
+  external_network_name:
+    description: >
+      Openstack tenant external network name
+    default: "provider"
+
+  external_subnet_name:
+    description: >
+      Openstack tenant external subnet name, under external network
+    default: "provider_subnet"
+
+dsl_definitions:
+
+#######
+##   API clinet- referes to plugin
+#######
+  openstack_config: &openstack_config
+    username: { get_secret: keystone_username }
+    password: { get_secret: keystone_password }
+    tenant_name: { get_secret: keystone_tenant_name }
+    auth_url: { get_secret: keystone_url }
+    region: { get_secret: region }
+
+node_templates:
+
+#######
+##   configuration the VNF using terminal
+#######
+  vyos_branch_vnf_baseline_config:
+    type: cloudify.terminal.raw
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          inputs:
+            terminal_auth: &terminal_auth
+              user: { get_input: user }
+              password: { get_input: password }
+              ip: { get_attribute: [vyos_vnf_branch, ip ] }
+              promt_check:
+                - '#'
+                - '$'
+              errors:
+                - "Command fail."
+            calls:
+              - action: exit
+        start:
+          inputs:
+            terminal_auth: *terminal_auth
+            calls:
+              - action: config
+              - template: resources/vyos-vnf-branch-baseline.config
+                params:
+                  AREA_0_NETWORK_CIDR: { get_input: base_network_cidr }
+                  BRANCH_HOSTNAME: { get_input: branch_hostname }
+                  BRANCH_LAN_ADDRESS: { get_attribute: [vyos_vnf_branch, networks, { get_input: branch_lan_name }, 0] }
+              - action: commit
+              - action: save
+    relationships:
+      - type: cloudify.relationships.depends_on
+        target: vyos_vnf_branch
+
+#######
+##   instantiation the VNF using Openstack client
+#######
+  vyos_vnf_branch:
+    type: cloudify.openstack.nodes.Server
+    properties:
+      openstack_config: *openstack_config
+      agent_config:
+        install_method: none
+      server:
+        key_name: ''
+        image: "vyos-image"
+        flavor: { get_input: flavor }
+      management_network_name: { get_property: [ mgmt_network, resource_id ] }
+    relationships:
+    - type: cloudify.openstack.server_connected_to_port
+      target: mgmt_port
+    - type: cloudify.openstack.server_connected_to_port
+      target: wan_network_port
+    - type: cloudify.openstack.server_connected_to_port
+      target: lan_network_port
+    - type: cloudify.relationships.depends_on
+      target: vyos_image
+
+#######
+##   attaching MGMT port using Openstack client
+#######
+  mgmt_port:
+    type: cloudify.openstack.nodes.Port
+    properties:
+      openstack_config: *openstack_config
+    relationships:
+    - type: cloudify.relationships.contained_in
+      target: mgmt_network
+    - type: cloudify.relationships.depends_on
+      target: mgmt_subnet
+    - type: cloudify.openstack.port_connected_to_security_group
+      target: security_group
+    - type: cloudify.openstack.port_connected_to_floating_ip
+      target: ip
+
+#######
+##   attaching LAN port using Openstack client
+#######
+  lan_network_port:
+    type: cloudify.openstack.nodes.Port
+    properties:
+      openstack_config: *openstack_config
+    relationships:
+    - type: cloudify.relationships.contained_in
+      target: lan_network
+    - type: cloudify.relationships.depends_on
+      target: lan_network_subnet
+    - type: cloudify.openstack.port_connected_to_security_group
+      target: security_group
+
+#######
+##   attaching WAN port using Openstack client
+#######
+  wan_network_port:
+    type: cloudify.openstack.nodes.Port
+    properties:
+      openstack_config: *openstack_config
+    relationships:
+    - type: cloudify.relationships.contained_in
+      target: wan_network
+    - type: cloudify.relationships.depends_on
+      target: wan_network_subnet
+    - type: cloudify.openstack.port_connected_to_security_group
+      target: security_group
+
+#######
+##   retrieving and uploading the VM image using Openstack client
+#######
+  vyos_image:
+    type: cloudify.openstack.nodes.Image
+    properties:
+      image:
+        container_format: "bare"
+        disk_format: "qcow2"
+      openstack_config: *openstack_config
+      image_url: {get_input : vyos_image_url }
+      use_external_resource: true
+      create_if_missing: true
+      resource_id: "vyos-image"
+
+#######
+##   attaching to MGMT subnet using Openstack client
+#######
+  mgmt_subnet:
+    type: cloudify.openstack.nodes.Subnet
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: { get_input: external_subnet_name }
+  #   resource_id: { concat: [{ get_input: external_network_name }, '_subnet'] }
+    relationships:
+    - target: mgmt_network
+      type: cloudify.relationships.contained_in
+
+#######
+##   attaching to MGMT network using Openstack client
+#######
+  mgmt_network:
+    type: cloudify.openstack.nodes.Network
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: { get_input: external_network_name }
+
+#######
+##   creating LAN subnet using Openstack client
+#######
+  lan_network_subnet:
+    type: cloudify.openstack.nodes.Subnet
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: false
+      resource_id: lan_net_subnet
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          inputs:
+            args:
+              gateway_ip: null
+              cidr: { get_input: branch_lan_address }
+              ip_version: 4
+      cloudify.interfaces.validation:
+        creation:
+          inputs:
+            args:
+              gateway_ip: null
+              cidr: { get_input: branch_lan_address }
+              ip_version: 4
+    relationships:
+    - target: lan_network
+      type: cloudify.relationships.contained_in
+
+#######
+##   creating LAN network using Openstack client
+#######
+  lan_network:
+    type: cloudify.openstack.nodes.Network
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: false
+      resource_id: { get_input: branch_lan_name }
+
+#######
+##   creating WAN subnet using Openstack client
+#######
+  wan_network_subnet:
+    type: cloudify.openstack.nodes.Subnet
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: wan_net_subnet
+    relationships:
+    - target: wan_network
+      type: cloudify.relationships.contained_in
+
+#######
+##   creating WAN network using Openstack client
+#######
+  wan_network:
+    type: cloudify.openstack.nodes.Network
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: wan_net
+
+#######
+##   creating security groups using Openstack client
+#######
+  security_group:
+    type: cloudify.openstack.nodes.SecurityGroup
+    properties:
+      openstack_config: *openstack_config
+      security_group:
+#        name: security_group
+        description: generic security group
+      rules:
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: "TCP"
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: "UDP"
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: "ICMP"
+          port_range_min: 0
+          port_range_max: 0
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: 47
+  ip:
+    type: cloudify.openstack.nodes.FloatingIP
+    properties:
+      openstack_config: *openstack_config
+      floatingip:
+        floating_network_name: { get_secret: external_network_name }
+
+#######
+##   declaring outputs of the deployment
+#######
+outputs:
+
+  vyos_vnf_branch_mgmt_ip:
+    value: { get_attribute: [vyos_vnf_branch, ip] }
+  vyos_vnf_branch_wan_ip:
+    value: { get_attribute: [vyos_vnf_branch, networks, wan_net] }
+  vyos_vnf_branch_username:
+    value: { get_input: user }
+  vyos_vnf_branch_password:
+    value: { get_input: password }
